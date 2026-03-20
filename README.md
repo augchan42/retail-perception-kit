@@ -126,4 +126,4 @@ This is stronger than generic indoor directions — it's business output from da
 
 ## License
 
-MIT
+MIT# retail-perception-kit
