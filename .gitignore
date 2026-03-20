@@ -1,0 +1,6 @@
+node_modules/
+.next/
+.next-types.d.ts
+*.log
+.DS_Store
+.env*.local
