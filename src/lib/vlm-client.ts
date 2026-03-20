@@ -1,17 +1,10 @@
 /**
  * VLM Client Interface
- * 
- * This file shows the integration points for real VLM analysis.
- * 
- * V1: Uses MockVLMClient for demo purposes.
- * 
- * REAL INTEGRATION:
- * 1. RealVLMClient connects to local Ollama instance
- * 2. Or connect to vlm-node API (see vlm-node repo)
- * 
- * Repos:
- * - vlm-node: https://github.com/aukilabs/vlm-node
- * - Ollama: https://ollama.com
+ *
+ * V1: MockVLMClient for offline demo
+ * V2: RealVLMClient connects to local Ollama (Qwen3-VL-32B)
+ *
+ * See ADR-001 for model selection rationale.
  */
 
 export interface Finding {
@@ -26,19 +19,77 @@ export interface VLMAnalysisResult {
 }
 
 export interface VLMClient {
-  analyze(observations: { id: string; url: string }[], domainId: string): Promise<VLMAnalysisResult>;
+  analyze(images: string[], domainId: string): Promise<VLMAnalysisResult>;
+}
+
+const VALID_FINDING_TYPES = new Set([
+  "empty_shelf",
+  "compliance_mismatch",
+  "sign_missing",
+  "spill",
+  "obstruction",
+]);
+
+const SYSTEM_PROMPT = `You are a retail shelf auditor. Analyze the provided retail store image(s) and identify issues.
+
+Return ONLY a JSON array of findings. Each finding must have:
+- "type": one of "empty_shelf", "compliance_mismatch", "sign_missing", "spill", "obstruction"
+- "location": a short description of where in the image (e.g. "top shelf, left side")
+- "confidence": a number between 0 and 1
+
+Example output:
+[
+  {"type": "empty_shelf", "location": "bottom shelf, center", "confidence": 0.92},
+  {"type": "sign_missing", "location": "endcap display", "confidence": 0.78}
+]
+
+If you see no issues, return an empty array: []
+
+Return ONLY the JSON array, no other text.`;
+
+/**
+ * Parse the VLM's text response into typed Finding[].
+ * Handles markdown code fences and extracts the JSON array.
+ */
+function parseFindings(raw: string): Finding[] {
+  // Strip markdown code fences if present
+  let cleaned = raw.trim();
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) {
+    cleaned = fenceMatch[1].trim();
+  }
+
+  // Find the JSON array in the response
+  const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+  if (!arrayMatch) return [];
+
+  try {
+    const parsed = JSON.parse(arrayMatch[0]);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter(
+        (f: Record<string, unknown>) =>
+          VALID_FINDING_TYPES.has(f.type as string) &&
+          typeof f.location === "string" &&
+          typeof f.confidence === "number"
+      )
+      .map((f: Record<string, unknown>) => ({
+        type: f.type as Finding["type"],
+        location: f.location as string,
+        confidence: Math.max(0, Math.min(1, f.confidence as number)),
+      }));
+  } catch {
+    return [];
+  }
 }
 
 /**
- * Mock VLM Client
- * Returns sample findings for demo purposes
+ * Mock VLM Client — returns sample findings for offline demos.
  */
 export class MockVLMClient implements VLMClient {
-  async analyze(observations: { id: string; url: string }[], domainId: string): Promise<VLMAnalysisResult> {
-    // Simulate processing delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    
-    // Return sample findings
+  async analyze(_images: string[], _domainId: string): Promise<VLMAnalysisResult> {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
     return {
       findings: [
         { type: "empty_shelf", location: "aisle-3-bay-2", confidence: 0.91 },
@@ -51,52 +102,52 @@ export class MockVLMClient implements VLMClient {
 }
 
 /**
- * Real VLM Client (TODO: Implement)
- * 
- * Connect to Ollama or vlm-node:
- * 
- * Option 1: Local Ollama
- * const response = await fetch('http://localhost:11434/api/generate', {
- *   method: 'POST',
- *   headers: { 'Content-Type': 'application/json' },
- *   body: JSON.stringify({
- *     model: 'moondream:1.8b',
- *     prompt: 'Analyze this retail image for: empty shelves, compliance issues, missing signs',
- *     images: [base64Image]
- *   })
- * });
- * 
- * Option 2: vlm-node API
- * const response = await fetch('https://your-vlm-node.com/api/v1/jobs', {
- *   method: 'POST',
- *   headers: { 'Content-Type': 'application/json' },
- *   body: JSON.stringify({
- *     job_type: 'task_timing_v1',
- *     domain_id: domainId,
- *     input: {
- *       prompt: 'Analyze for retail compliance...',
- *       vlm_prompt: 'Describe what you see in this image'
- *     }
- *   })
- * });
- * 
- * Then parse response into Finding[] format.
+ * Real VLM Client — calls local Ollama with Qwen3-VL.
+ * Used via the /api/analyze server route (not directly from the browser).
  */
 export class RealVLMClient implements VLMClient {
   private endpoint: string;
   private model: string;
 
-  constructor(endpoint: string = "http://localhost:11434", model: string = "moondream:1.8b") {
-    this.endpoint = endpoint;
-    this.model = model;
+  constructor(
+    endpoint?: string,
+    model?: string,
+  ) {
+    this.endpoint = endpoint || "http://localhost:11434";
+    this.model = model || "qwen3-vl:32b-instruct";
   }
 
-  async analyze(observations: { id: string; url: string }[], domainId: string): Promise<VLMAnalysisResult> {
-    // TODO: Implement actual VLM call
-    throw new Error("Not implemented - connect to Ollama or vlm-node");
+  async analyze(base64Images: string[], domainId: string): Promise<VLMAnalysisResult> {
+    const domainContext = domainId ? ` This is store/domain: ${domainId}.` : "";
+
+    const response = await fetch(`${this.endpoint}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: this.model,
+        stream: false,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          {
+            role: "user",
+            content: `Analyze these retail shelf image(s) for issues.${domainContext}`,
+            images: base64Images,
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Ollama error ${response.status}: ${text}`);
+    }
+
+    const data = await response.json();
+    const raw: string = data.message?.content ?? "";
+    const findings = parseFindings(raw);
+
+    return { findings, rawResponse: raw };
   }
 }
 
-// V1: Export mock by default
-// Change to RealVLMClient for real integration
-export const vlmClient = new MockVLMClient();
+export const mockClient = new MockVLMClient();
