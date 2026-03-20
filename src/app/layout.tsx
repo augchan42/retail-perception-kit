@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Retail Perception Kit",
-  description: "Phone-based retail audit demo - perception first, robots later",
+  description: "Phone-based retail audit demo — perception first, robots later",
 };
 
 export default function RootLayout({
@@ -13,7 +13,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className="min-h-screen bg-gray-50">{children}</body>
+      <body className="min-h-screen antialiased">{children}</body>
     </html>
   );
 }
