@@ -63,6 +63,14 @@ The Retail Perception Kit MVP needs a vision-language model (VLM) to analyze ret
 - More complex setup; less ergonomic API for our Next.js integration
 - Worth revisiting for production but adds complexity for MVP
 
+### 7. vLLM
+
+- High-throughput inference server designed for NVIDIA GPU clusters
+- Optimized for concurrent multi-user serving, not single-user latency
+- macOS/Apple Silicon support is limited/experimental
+- Overkill for a local demo on one MacBook
+- **Future relevance:** When scaling to production (Linux server with NVIDIA GPUs serving multiple stores concurrently), vLLM becomes the right choice. Not needed for the grant demo.
+
 ## Decision
 
 **Use Qwen3-VL-32B-Instruct via Ollama** as the primary model, with **Qwen3-VL-8B** as a fast fallback.
@@ -74,6 +82,21 @@ The Retail Perception Kit MVP needs a vision-language model (VLM) to analyze ret
 - **Structured output** capability means we can prompt for JSON matching our `Finding[]` schema directly
 - **Native resolution** handling avoids downscaling shelf photos where small details (price tags, labels) matter
 - **No cloud dependency** — entire demo runs offline, which is a plus for grant presentations in venues with unreliable wifi
+
+## Inference Stack
+
+Ollama is a user-friendly wrapper around **llama.cpp**, which is the actual inference engine. Understanding the layers matters for debugging and future optimization:
+
+| Layer | What | Role |
+|-------|------|------|
+| **Model format** | GGUF (quantized) | Optimized for CPU/Metal inference, smaller than full-precision weights |
+| **Inference engine** | llama.cpp (bundled in Ollama) | Runs the model on Apple Silicon via Metal GPU acceleration |
+| **API layer** | Ollama REST API (`localhost:11434`) | Simple HTTP interface, no config needed |
+| **Our code** | `RealVLMClient` → Ollama API | Already stubbed in `src/lib/vlm-client.ts` |
+
+**Why not llama.cpp directly?** You *can* run llama.cpp's `llama-server` directly with a GGUF file for slightly more control (context size tuning, batch size, etc.), but Ollama handles model management, quantization selection, and Metal configuration automatically. For the MVP, the convenience wins.
+
+**Why not vLLM?** vLLM is designed for high-throughput production serving on NVIDIA GPUs — multiple concurrent requests across many stores. It's the right tool when we scale to a centralized VLM endpoint serving 100,000+ locations, but for a local MacBook demo it adds complexity with no benefit. macOS support is also limited.
 
 ## Setup
 
