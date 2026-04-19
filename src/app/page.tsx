@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Camera,
   Search,
@@ -16,6 +16,11 @@ import {
   ChevronUp,
 } from "lucide-react";
 import type { Finding } from "@/lib/vlm-client";
+import {
+  DirectPlanner,
+  type ActionPlan,
+  type PlannedAction,
+} from "@/lib/planner";
 
 interface Observation {
   id: string;
@@ -24,11 +29,7 @@ interface Observation {
   name: string;
 }
 
-interface Task {
-  id: string;
-  description: string;
-  findingType: string;
-}
+const planner = new DirectPlanner();
 
 const FINDING_ICONS: Record<string, React.ReactNode> = {
   empty_shelf: <Package className="w-5 h-5" />,
@@ -46,12 +47,16 @@ const FINDING_LABELS: Record<string, string> = {
   obstruction: "Obstruction",
 };
 
-const TASK_TEMPLATES: Record<string, (location: string) => string> = {
-  empty_shelf: (loc) => `Restock shelves at ${loc}`,
-  compliance_mismatch: (loc) => `Fix compliance issue at ${loc}`,
-  sign_missing: (loc) => `Replace missing signage at ${loc}`,
-  spill: (loc) => `Clean up spill at ${loc}`,
-  obstruction: (loc) => `Clear obstruction at ${loc}`,
+const URGENCY_COLORS: Record<PlannedAction["urgency"], string> = {
+  immediate: "bg-red-50 border-red-200 text-red-700",
+  soon: "bg-amber-50 border-amber-200 text-amber-700",
+  routine: "bg-emerald-50 border-emerald-200 text-emerald-700",
+};
+
+const URGENCY_LABELS: Record<PlannedAction["urgency"], string> = {
+  immediate: "Immediate",
+  soon: "Soon",
+  routine: "Routine",
 };
 
 function HelpTip({ text }: { text: string }) {
@@ -83,17 +88,6 @@ function HelpTip({ text }: { text: string }) {
   );
 }
 
-function generateTasks(findings: Finding[]): Task[] {
-  return findings.map((f, i) => ({
-    id: `t-${i}`,
-    description:
-      (TASK_TEMPLATES[f.type] ?? ((loc: string) => `Address issue at ${loc}`))(
-        f.location
-      ),
-    findingType: f.type,
-  }));
-}
-
 async function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -109,13 +103,22 @@ export default function Home() {
   const [observations, setObservations] = useState<Observation[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [findings, setFindings] = useState<Finding[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
+  const [plan, setPlan] = useState<ActionPlan | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [useMock, setUseMock] = useState(true);
   const [rawResponse, setRawResponse] = useState<string | null>(null);
   const [showDomain, setShowDomain] = useState(false);
 
-  const hasResults = findings.length > 0 || tasks.length > 0;
+  const observationsRef = useRef(observations);
+  observationsRef.current = observations;
+
+  useEffect(() => {
+    return () => {
+      observationsRef.current.forEach((obs) => URL.revokeObjectURL(obs.url));
+    };
+  }, []);
+
+  const hasResults = findings.length > 0 || plan !== null;
 
   const handleAnalyze = async () => {
     if (observations.length === 0) return;
@@ -133,10 +136,12 @@ export default function Home() {
           location: "promo-endcap-1",
           confidence: 0.84,
         },
+        { type: "spill", location: "aisle-5-entrance", confidence: 0.95 },
         { type: "sign_missing", location: "aisle-7", confidence: 0.78 },
       ];
       setFindings(mockFindings);
-      setTasks(generateTasks(mockFindings));
+      const actionPlan = await planner.plan({ findings: mockFindings, domainId });
+      setPlan(actionPlan);
       setRawResponse("[Mock VLM Response]");
       setIsAnalyzing(false);
       return;
@@ -161,19 +166,21 @@ export default function Home() {
 
       const vlmFindings: Finding[] = data.findings ?? [];
       setFindings(vlmFindings);
-      setTasks(generateTasks(vlmFindings));
       setRawResponse(data.rawResponse ?? null);
 
       if (vlmFindings.length === 0) {
         setError(
           "No issues detected. The image may not contain retail problems, or try a clearer photo."
         );
+      } else {
+        const actionPlan = await planner.plan({ findings: vlmFindings, domainId });
+        setPlan(actionPlan);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Analysis failed";
       setError(msg);
       setFindings([]);
-      setTasks([]);
+      setPlan(null);
     } finally {
       setIsAnalyzing(false);
     }
@@ -183,14 +190,35 @@ export default function Home() {
     const files = e.target.files;
     if (!files) return;
 
-    const newObservations: Observation[] = Array.from(files).map(
-      (file, i) => ({
-        id: `obs-${Date.now()}-${i}`,
-        file,
-        url: URL.createObjectURL(file),
-        name: file.name,
-      })
-    );
+    const MAX_FILES = 5;
+    const MAX_FILE_SIZE = 10 * 1024 * 1024;
+    const ACCEPTED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+    const incoming = Array.from(files);
+    const slotsAvailable = MAX_FILES - observations.length;
+
+    if (slotsAvailable <= 0) {
+      setError(`Maximum ${MAX_FILES} images allowed.`);
+      return;
+    }
+
+    const accepted = incoming.slice(0, slotsAvailable).filter((file) => {
+      if (!ACCEPTED_TYPES.has(file.type)) return false;
+      if (file.size > MAX_FILE_SIZE) return false;
+      return true;
+    });
+
+    if (accepted.length === 0 && incoming.length > 0) {
+      setError("Files must be PNG, JPEG, or WebP under 10MB.");
+      return;
+    }
+
+    const newObservations: Observation[] = accepted.map((file, i) => ({
+      id: `obs-${Date.now()}-${i}`,
+      file,
+      url: URL.createObjectURL(file),
+      name: file.name,
+    }));
 
     setObservations((current) => [...current, ...newObservations]);
   };
@@ -207,7 +235,7 @@ export default function Home() {
     observations.forEach((obs) => URL.revokeObjectURL(obs.url));
     setObservations([]);
     setFindings([]);
-    setTasks([]);
+    setPlan(null);
     setError(null);
     setRawResponse(null);
   };
@@ -486,38 +514,66 @@ export default function Home() {
               </div>
             </section>
 
-            {/* Tasks */}
-            <section className="bg-white rounded-xl border border-border p-5 md:p-6">
-              <div className="flex items-center gap-2 mb-5">
-                <svg
-                  className="w-5 h-5 text-sage shrink-0"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                >
-                  <polyline points="9 11 12 14 22 4" />
-                  <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-                </svg>
-                <span className="font-display font-semibold text-xl text-ink">
-                  {tasks.length} Task{tasks.length !== 1 ? "s" : ""} Generated
-                </span>
-                <HelpTip text="Actionable tasks auto-generated from findings. In production, these would be assigned to staff and routed via Auki's pathfinding." />
-              </div>
-              <div className="space-y-3">
-                {tasks.map((task) => (
-                  <div
-                    key={task.id}
-                    className="flex items-start gap-4 p-4 bg-parchment rounded-xl border border-border"
-                  >
-                    <div className="w-6 h-6 rounded border-2 border-border-strong mt-0.5 shrink-0" />
-                    <div className="font-mono text-xl text-ink-secondary leading-relaxed pt-0.5">
-                      {task.description}
-                    </div>
+            {/* Action Plan */}
+            {plan && (
+              <section className="bg-white rounded-xl border border-border p-5 md:p-6">
+                <div className="flex items-center justify-between mb-5">
+                  <div className="flex items-center gap-2">
+                    <svg
+                      className="w-5 h-5 text-sage shrink-0"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                    >
+                      <polyline points="9 11 12 14 22 4" />
+                      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                    </svg>
+                    <span className="font-display font-semibold text-xl text-ink">
+                      Action Plan
+                    </span>
+                    <span className="font-mono text-xl text-ink-muted">
+                      {plan.summary}
+                    </span>
                   </div>
-                ))}
-              </div>
-            </section>
+                  <HelpTip text="Prioritized actions generated from findings. Tasks are ordered by urgency and confidence. Expand any task to see the reasoning behind its priority." />
+                </div>
+                <div className="space-y-3">
+                  {plan.actions.map((action) => (
+                    <details
+                      key={action.id}
+                      className="group bg-parchment rounded-xl border border-border"
+                    >
+                      <summary className="flex items-start gap-4 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+                        <span className="font-mono text-xl font-semibold text-accent tabular-nums mt-0.5 shrink-0 w-6 text-center">
+                          {action.priority}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          <div className="font-mono text-xl text-ink-secondary leading-relaxed">
+                            {action.description}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-mono text-xl text-ink-muted tabular-nums">
+                            {action.estimatedEffort}
+                          </span>
+                          <span
+                            className={`font-mono text-sm font-medium px-2.5 py-0.5 rounded-full border ${URGENCY_COLORS[action.urgency]}`}
+                          >
+                            {URGENCY_LABELS[action.urgency]}
+                          </span>
+                        </div>
+                      </summary>
+                      <div className="px-4 pb-4 pt-0 ml-10">
+                        <div className="font-mono text-xl text-ink-muted leading-relaxed border-t border-border pt-3">
+                          {action.reasoning}
+                        </div>
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              </section>
+            )}
 
             {/* Raw VLM Response */}
             {rawResponse && !useMock && (

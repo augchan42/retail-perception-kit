@@ -120,22 +120,31 @@ export class RealVLMClient implements VLMClient {
   async analyze(base64Images: string[], domainId: string): Promise<VLMAnalysisResult> {
     const domainContext = domainId ? ` This is store/domain: ${domainId}.` : "";
 
-    const response = await fetch(`${this.endpoint}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: this.model,
-        stream: false,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: `Analyze these retail shelf image(s) for issues.${domainContext}`,
-            images: base64Images,
-          },
-        ],
-      }),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.endpoint}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: this.model,
+          stream: false,
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            {
+              role: "user",
+              content: `Analyze these retail shelf image(s) for issues.${domainContext}`,
+              images: base64Images,
+            },
+          ],
+        }),
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       const text = await response.text();
